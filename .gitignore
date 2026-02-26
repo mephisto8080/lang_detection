@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.idea/
+logs/*.log
+models/lid.176.bin
+*.egg-info/
+.env
