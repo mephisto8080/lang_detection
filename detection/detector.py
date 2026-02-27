@@ -1,28 +1,21 @@
 import os
 import re
 import logging
-import requests
-import numpy as np
 import fasttext
+import requests
+from wordfreq import zipf_frequency
 
-import config
-
-# Fix NumPy 2.x compatibility with fasttext
-# fasttext uses np.array(obj, copy=False) which is incompatible with NumPy 2.x
-_original_np_array = np.array
-
-def _patched_np_array(obj, *args, **kwargs):
-    if "copy" in kwargs and kwargs["copy"] is False:
-        kwargs.pop("copy")
-        return np.asarray(obj, *args, **kwargs)
-    return _original_np_array(obj, *args, **kwargs)
-
-np.array = _patched_np_array
+import config as settings
 
 logger = logging.getLogger(__name__)
 
-# Mapping of fasttext language codes to human-readable names
-LANGUAGE_NAMES = {
+
+class LanguageDetector:
+
+    # ==================================================
+    # LANGUAGE NAME MAP (DEFINED LOCALLY)
+    # ==================================================
+    LANGUAGE_NAME_MAP = {
     "af": "Afrikaans", "als": "Alemannic", "am": "Amharic", "an": "Aragonese",
     "ar": "Arabic", "arz": "Egyptian Arabic", "as": "Assamese", "ast": "Asturian",
     "av": "Avaric", "az": "Azerbaijani", "azb": "South Azerbaijani", "ba": "Bashkir",
@@ -69,81 +62,121 @@ LANGUAGE_NAMES = {
     "yi": "Yiddish", "yo": "Yoruba", "yue": "Cantonese", "zh": "Chinese",
 }
 
-
-class LanguageDetector:
     def __init__(self):
         self.model = None
-        self.model_loaded = False
+        self.supported_languages = 176
 
+    # ==================================================
+    # MODEL LOADING
+    # ==================================================
     def load_model(self):
-        """Load the fasttext language identification model. Downloads if not present."""
-        model_path = config.MODEL_PATH
+        if not os.path.exists(settings.MODEL_PATH):
+            logger.info("Model not found. Downloading...")
+            self._download_model()
 
-        if not os.path.exists(model_path):
-            logger.info(f"Model not found at {model_path}. Downloading...")
-            self._download_model(model_path)
+        logger.info("Loading FastText model...")
+        self.model = fasttext.load_model(settings.MODEL_PATH)
+        logger.info("Model loaded successfully.")
 
-        logger.info(f"Loading fasttext model from {model_path}...")
-        self.model = fasttext.load_model(model_path)
-        self.model_loaded = True
-        logger.info("FastText language detection model loaded successfully.")
+    def _download_model(self):
+        os.makedirs(os.path.dirname(settings.MODEL_PATH), exist_ok=True)
 
-    def _download_model(self, model_path: str):
-        """Download the fasttext lid.176.bin model."""
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        logger.info(f"Downloading model from {config.MODEL_URL}...")
-
-        response = requests.get(config.MODEL_URL, stream=True)
+        response = requests.get(settings.MODEL_URL, stream=True)
         response.raise_for_status()
 
-        total_size = int(response.headers.get("content-length", 0))
-        downloaded = 0
-
-        with open(model_path, "wb") as f:
+        with open(settings.MODEL_PATH, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
-                downloaded += len(chunk)
-                if total_size > 0:
-                    pct = (downloaded / total_size) * 100
-                    if downloaded % (10 * 1024 * 1024) < 8192:
-                        logger.info(f"Download progress: {pct:.1f}%")
 
-        logger.info(f"Model downloaded successfully to {model_path}")
+        logger.info("Model downloaded successfully.")
 
+    # ==================================================
+    # TEXT PREPROCESSING
+    # ==================================================
     def _preprocess_text(self, text: str) -> str:
-        """Clean and normalize input text for detection."""
         text = text.strip()
         text = re.sub(r"\s+", " ", text)
-        text = text.replace("\n", " ")
         return text
 
-    def detect(self, text: str, top_n: int = 5) -> list[dict]:
-        """
-        Detect the language of the given text.
+    # ==================================================
+    # ENGLISH RATIO CALCULATION
+    # ==================================================
+    def _english_word_ratio(self, text: str) -> float:
 
-        Returns a list of predictions, each with:
-          - language_code
-          - language_name
-          - confidence
-        """
-        if not self.model_loaded:
-            raise RuntimeError("Model not loaded. Call load_model() first.")
+        all_words = text.split()
 
-        cleaned = self._preprocess_text(text)
-        if not cleaned:
-            return []
+        if not all_words:
+            return 0.0
 
-        labels, scores = self.model.predict(cleaned, k=top_n)
+        english_valid = 0
+
+        for word in all_words:
+            latin_word = re.sub(r"[^a-zA-Z']", "", word).lower()
+
+            if latin_word:
+                if zipf_frequency(latin_word, "en") > settings.ZIPF_FREQUENCY_THRESHOLD:
+                    english_valid += 1
+
+        ratio = english_valid / len(all_words)
+
+        logger.info(
+            f"English words: {english_valid}, "
+            f"Total words: {len(all_words)}, "
+            f"Ratio: {ratio:.3f}"
+        )
+
+        return ratio
+
+    # ==================================================
+    # MAIN DETECTION
+    # ==================================================
+    def detect(self, text: str, top_n: int = None):
+
+        if not self.model:
+            raise RuntimeError("Model not loaded.")
+
+        top_n = top_n or settings.DEFAULT_TOP_N
+
+        cleaned_text = self._preprocess_text(text)
+
+        labels, scores = self.model.predict(cleaned_text, k=top_n)
 
         predictions = []
+
         for label, score in zip(labels, scores):
-            # fasttext labels are like "__label__en"
-            lang_code = label.replace("__label__", "")
+            language_code = label.replace("__label__", "")
+
+            language_name = self.LANGUAGE_NAME_MAP.get(
+                language_code,
+                language_code
+            )
+
             predictions.append({
-                "language_code": lang_code,
-                "language_name": LANGUAGE_NAMES.get(lang_code, lang_code),
-                "confidence": round(float(score), 4),
+                "language_code": language_code,
+                "language_name": language_name,
+                "confidence": float(score)
             })
+
+        # ==================================================
+        # HINGLISH OVERRIDE LOGIC
+        # ==================================================
+        if settings.HINGLISH_ENABLED and predictions:
+
+            top_language = predictions[0]["language_code"]
+            total_words = len(cleaned_text.split())
+
+            if top_language == "en" and total_words >= settings.MIN_WORDS_FOR_CHECK:
+
+                english_ratio = self._english_word_ratio(cleaned_text)
+
+                if english_ratio < settings.ENGLISH_WORD_THRESHOLD:
+                    logger.info("Overriding detection to Hinglish.")
+
+                    predictions.insert(0, {
+                        "language_code": "hinglish",
+                        "language_name": "Hinglish",
+                        "confidence": predictions[0]["confidence"]
+                    })
 
         return predictions
 

@@ -1,78 +1,62 @@
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 import logging
 
-from fastapi import APIRouter, HTTPException
-
-import config
-from detection.detector import detector
-from detection.schemas import (
-    DetectRequest,
-    DetectResponse,
-    BatchDetectRequest,
-    BatchDetectResponse,
-    LanguagePrediction,
-    HealthResponse,
-)
-
-logger = logging.getLogger(__name__)
+from .schemas import DetectRequest, DetectResponse, BatchDetectRequest
+from .detector import detector
+import config as settings
 
 router = APIRouter(prefix="/api/v1", tags=["Language Detection"])
-
-
-def _build_response(text: str, top_n: int) -> DetectResponse:
-    """Run detection on a single text and build the response."""
-    predictions_raw = detector.detect(text, top_n=top_n)
-
-    if not predictions_raw:
-        raise HTTPException(status_code=400, detail="Could not detect language. Text may be empty or invalid.")
-
-    predictions = [LanguagePrediction(**p) for p in predictions_raw]
-    detected = predictions[0]
-    text_length = len(text.strip())
-
-    confidence_note = None
-    if text_length < config.SHORT_TEXT_CHAR_LIMIT:
-        confidence_note = (
-            f"Short text ({text_length} chars). "
-            "Results may be less accurate. Provide more text for better detection."
-        )
-    elif detected.confidence < config.MIN_CONFIDENCE_THRESHOLD:
-        confidence_note = (
-            f"Low confidence ({detected.confidence:.2f}). "
-            "The text may contain mixed languages or be ambiguous."
-        )
-
-    return DetectResponse(
-        detected_language=detected,
-        predictions=predictions,
-        text_length=text_length,
-        confidence_note=confidence_note,
-    )
+logger = logging.getLogger(__name__)
 
 
 @router.post("/detect", response_model=DetectResponse)
 async def detect_language(request: DetectRequest):
-    """Detect the language of a given text string."""
-    logger.info(f"Detecting language for text of length {len(request.text)}")
-    return _build_response(request.text, request.top_n)
+
+    try:
+        predictions = detector.detect(request.text, request.top_n)
+
+        response = {
+            "detected_language": predictions[0] if predictions else None,
+            "predictions": predictions,
+            "text_length": len(request.text),
+            "confidence_note": None
+        }
+
+        if predictions and predictions[0]["confidence"] < settings.MIN_CONFIDENCE_THRESHOLD:
+            response["confidence_note"] = "Low confidence detection."
+
+        return response
+
+    except Exception as e:
+        logger.exception("Detection failed.")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 
-@router.post("/detect/batch", response_model=BatchDetectResponse)
-async def detect_language_batch(request: BatchDetectRequest):
-    """Detect languages for multiple texts in a single request."""
-    logger.info(f"Batch detection for {len(request.texts)} texts")
+@router.post("/detect/batch")
+async def detect_batch(request: BatchDetectRequest):
 
     results = []
+
     for text in request.texts:
-        results.append(_build_response(text, request.top_n))
+        predictions = detector.detect(text, request.top_n)
+        results.append({
+            "text": text,
+            "detected_language": predictions[0] if predictions else None,
+            "predictions": predictions
+        })
 
-    return BatchDetectResponse(results=results, total_texts=len(results))
+    return {"results": results}
 
 
-@router.get("/health", response_model=HealthResponse)
+@router.get("/health")
 async def health_check():
-    """Check service health and model status."""
-    return HealthResponse(
-        status="healthy" if detector.model_loaded else "unhealthy",
-        model_loaded=detector.model_loaded,
-        supported_languages=176,
-    )
+    return {
+        "status": "healthy",
+        "model_loaded": detector.model is not None,
+        "supported_languages": detector.supported_languages,
+        "hinglish_enabled": settings.HINGLISH_ENABLED
+    }
